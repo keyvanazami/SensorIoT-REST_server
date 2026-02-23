@@ -1,319 +1,448 @@
-from flask import Flask
-from flask import request
+from flask import Flask, request
 from flask_cors import CORS
-import pymongo
+from dotenv import load_dotenv
+from dateutil.tz import tzutc, gettz
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
 from pymongo import MongoClient
+import pymongo
 import json
 import datetime as dt
-from dateutil.tz import *
+import base64
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
 
 print('connecting to mongo...')
-client = MongoClient('localhost', 27017)  # make this explicit
+client = MongoClient('localhost', 27017)
 db = client['gdtechdb_prod']
-#db = client.test
 sensors = db['Sensors']
 sensorsLatest = db['SensorsLatest']
+nicknames = db['Nicknames']
+userProfiles = db['UserProfiles']
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
 app = Flask(__name__)
 CORS(app)
+
+from auth import auth_bp
+from fulfillment import fulfillment_bp
+app.register_blueprint(auth_bp)
+app.register_blueprint(fulfillment_bp)
+
 timefmt = '%Y-%m-%d %H:%M:%S'
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def cleanvalue(value):
     return float(value.replace('b', '').replace('v', '').replace("'", ""))
 
-@app.route("/", methods=['GET'])
-def hello():
-    r = request
-    print(r)
-    dt.date.today()
-    print('hello returning...')
-    return 'hello ' + request.args.get('name', '')
-
-
-@app.route("/stats", methods=['GET'])
-def stats():
-    ct = sensors.count()
-    return 'total rows:' + str(ct)
-
-
-@app.route('/sensorlist', methods=['GET'])
-def sensorlist():
-    print('sensorlist returning...')
-    d = sensors.distinct('node_id') 
-    print(json.dumps(d))
-    return json.dumps(d)
-
-
-def today():
-    now = dt.date.today()
-    start = dt.datetime(now.year, now.month, now.day, 0, 0, 0, 0)
-    return start.timestamp()
-
 
 def getstart(p):
-    # p should be a number specifying the delta in hours.
+    """Return a Unix timestamp p hours before now. Defaults to 24 h."""
     nowdatetime = dt.datetime.now(tzutc())
     if p is None:
         diff = dt.timedelta(hours=24)
     else:
         diff = dt.timedelta(hours=int(p))
+    return (nowdatetime - diff).timestamp()
 
-    start = nowdatetime - diff
-    return start.timestamp()
+
+def decrypt_password_aes(encrypted_password_base64, shared_key_base64):
+    """Decrypt a base64-encoded AES-256-CBC password. IV is prepended to ciphertext."""
+    try:
+        shared_key_bytes = base64.urlsafe_b64decode(shared_key_base64)
+        encrypted_data = base64.urlsafe_b64decode(encrypted_password_base64)
+        iv = encrypted_data[:16]
+        ciphertext = encrypted_data[16:]
+        cipher = Cipher(algorithms.AES(shared_key_bytes), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted_padded = decryptor.update(ciphertext) + decryptor.finalize()
+        unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+        decrypted_data = unpadder.update(decrypted_padded) + unpadder.finalize()
+        return decrypted_data.decode('utf-8')
+    except Exception as e:
+        print(f"Decryption error: {e}")
+        return None
+
+# ---------------------------------------------------------------------------
+# Sensor Data
+# ---------------------------------------------------------------------------
+
+@app.route("/", methods=['GET'])
+def hello():
+    return 'hello ' + request.args.get('name', '')
+
+
+@app.route("/stats", methods=['GET'])
+def stats():
+    ct = sensors.countDocuments()
+    return 'total rows:' + str(ct)
+
+
+@app.route('/sensorlist', methods=['GET'])
+def sensorlist():
+    d = sensors.distinct('node_id')
+    return json.dumps(d)
+
 
 @app.route("/sensor/<node>", methods=['GET'])
-def people(node):
+def sensor(node):
     skip = request.args.get('skip', '')
     type = request.args.get('type', '')
     period = request.args.get('period')
     try:
         skip = int(skip)
-    except ValueError as err:
-        print('invalid skip parameter %s. defaulting.' % skip)
+    except ValueError:
         skip = 0
     try:
-        period = int(period)*24
-    except ValueError as err:
+        period = int(period) * 24
+    except (ValueError, TypeError):
         period = 24
+    return json.dumps(getdata(node, getstart(period), skip, type))
+
+
+@app.route("/latest/<gw>", methods=['GET'])
+def latest(gw):
+    try:
+        period = int(request.args.get('period', ''))
+    except ValueError:
+        period = 24
+    return json.dumps(getlatest(gw, getstart(period)))
+
+
+@app.route("/latests", methods=['GET'])
+def latests():
+    gateways = request.args.getlist('gw')
+    try:
+        period = int(request.args.get('period', ''))
+    except ValueError:
+        period = 1
     start = getstart(period)
-    docs = getdata(node, start, skip, type)
-    return json.dumps(docs)
+    results = [{'gateway_id': gw, 'latest': getlatest(gw, start)} for gw in gateways]
+    return json.dumps(results)
+
 
 @app.route("/nodelist/<gw>", methods=['GET'])
 def nodelist(gw):
-    period = request.args.get('period')
     try:
-        period = int(period)*24
-    except TypeError as err:
+        period = int(request.args.get('period')) * 24
+    except TypeError:
+        period = 24
+    return json.dumps(sorted(getnodelist(gw, getstart(period))))
+
+
+@app.route("/nodelists", methods=['GET'])
+def nodelists():
+    gateways = request.args.getlist('gw')
+    try:
+        period = int(request.args.get('period')) * 24
+    except TypeError:
         period = 24
     start = getstart(period)
-    values = getnodelist(gw, start)
-    return json.dumps(sorted(values))
+    results = [{'gateway_id': gw, 'nodes': getnodelist(gw, start)} for gw in gateways]
+    return json.dumps(results)
+
+
+@app.route("/gw/<gw>", methods=['GET'])
+def gw_data(gw):
+    nodes = request.args.getlist('node')
+    type = request.args.get('type', '')
+    timezone = request.args.get('timezone', 'None')
+    try:
+        period = int(request.args.get('period')) * 24
+    except (ValueError, TypeError):
+        period = 24
+    print('calling gwiteratenodes with', gw, nodes, type, period, timezone, 'at', dt.datetime.now())
+    return json.dumps(gwiteratenodes(gw, nodes, type, period, timezone))
+
 
 def getnodelist(gw, start):
     qry = {'gateway_id': gw, 'time': {'$gte': start}}
     print('query is %s' % qry)
-    print('starting query at ', dt.datetime.now())
     values = sensorsLatest.distinct('node_id', qry)
-    print('query returned at ', dt.datetime.now()) #this takes 16 millis
-    print(json.dumps(sorted(values)))
+    print('query returned at', dt.datetime.now())
     return values
 
-@app.route("/latest/<gw>", methods=['GET'])
-def latest(gw):
-    period = request.args.get('period','')
-    try:
-        period = int(period)
-    except ValueError as err:
-        period = 1
-    start=getstart(period)
-    values = getlatest(gw, start)
-    print(json.dumps(values))
-    return json.dumps(values)
 
 def getlatest(gw, start):
     docs = []
-    qry = {'gateway_id': gw, 'time': {'$gte':int(start)}}
+    qry = {'gateway_id': gw, 'time': {'$gte': int(start)}}
     sortparam = [('node_id', -1)]
-    print('query is ', qry, ' sort is ', sortparam)
     cursor = sensorsLatest.find(qry).sort(sortparam)
-    print('query run')
     for doc in cursor:
-        newdoc = { 'node_id': 0, 'type': '', 'value': 0, 'human_time': '', 'time': 0 }
-        newdoc['value'] = float(doc['value'].replace('b', '').replace('v', '').replace("'", ""))
-        newdoc['human_time'] = dt.datetime.fromtimestamp(doc['time']).strftime(timefmt)
-        newdoc['time'] = doc['time']
-        newdoc['type'] = doc['type']
-        newdoc['node_id'] = doc['node_id']
-        docs.append(newdoc)
-
-    print(json.dumps(docs))
+        docs.append({
+            'node_id': doc['node_id'],
+            'type': doc['type'],
+            'gateway_id': gw,
+            'value': cleanvalue(doc['value']),
+            'time': doc['time'],
+            'human_time': dt.datetime.fromtimestamp(doc['time']).strftime(timefmt),
+        })
     return docs
 
-@app.route("/gw/<gw>", methods=['GET'])
-def gw(gw):
-    nodes = request.args.getlist('node')
-    type = request.args.get('type', '')
-    period = request.args.get('period')
-    timezone = request.args.get('timezone','None')
-    returndocs = []
-    try:
-        period = int(period)*24
-    except ValueError as err:
-        period = 24
-    print('calling gwiteratenodes with ', gw, nodes, type, period, timezone, ' at ', dt.datetime.now())
-    returndocs = gwiteratenodes(gw, nodes, type, period, timezone)
-    return json.dumps(returndocs)
 
 def gwiteratenodes(gw, nodes, type, period, timezone):
     start = getstart(period)
     returndocs = []
     for node in nodes:
-        record = {'nodeID': 0, 'sensorData': []}
-        record['nodeID'] = node
-        print('calling gwdatausinggw with ', gw, node, start, type, timezone, dt.datetime.now())
-        record['sensorData'] = getdatausinggw(gw, node, start, type, timezone) 
-        print('finished getdatausinggw for', gw, node, start, type, timezone, dt.datetime.now())
+        print('calling getdatausinggw with', gw, node, start, type, timezone, dt.datetime.now())
+        record = {
+            'gateway_id': gw,
+            'nodeID': node,
+            'sensorData': getdatausinggw(gw, node, start, type, timezone),
+        }
         returndocs.append(record)
     return returndocs
 
+
 def getdatausinggw(gw, node, start, mytype, timezone):
-    print('getdatausinggw starting. C extentions in use:', pymongo.has_c())
+    print('getdatausinggw starting. C extensions in use:', pymongo.has_c())
     docs = []
-    resultsarray = []
     empty_results = {'results': '0'}
 
     try:
         toZone = gettz(timezone)
         fromZone = tzutc()
-    except ValueError as err:
-        print('Invalid timezone parameter %s. Defaulting to 0' % tz)
-        tz = 'None'
+    except ValueError:
+        print('Invalid timezone parameter %s. Defaulting to 0' % timezone)
+        toZone = gettz('UTC')
+        fromZone = tzutc()
 
     qry = {'gateway_id': gw, 'node_id': str(node), 'time': {'$gte': start}}
     sortparam = [('time', 1)]
     if mytype:
         qry['type'] = mytype
+
     print('query is %s and sort is ' % qry, sortparam)
-    print('starting query at ', dt.datetime.now())
-    cursor = sensors.find(qry).sort(sortparam).batch_size(100000)
-    print('query returned at ', dt.datetime.now()) #this takes .2 millis
-    for row in cursor:
-        resultsarray.append(row)
-    print('Arrayified at ', dt.datetime.now())
+    print('starting query at', dt.datetime.now())
+    resultsarray = list(sensors.find(qry).sort(sortparam).batch_size(100000))
     count = len(resultsarray)
-    print('%i records returned' % count, dt.datetime.now()); #this takes 1.86 sec
-    ct = 0
-    total = 0
-    skip=0
+    print('%i records returned' % count, dt.datetime.now())
+
     if count == 0:
         return empty_results
-    if count > 300:
-        skip = int(count/300 +.49)
-        print('Since more than 300 records were returned, skip is set to %i' % skip, dt.datetime.now()) #this take .1 milli
 
-    #insert initial doc as first 'goalpost' with time same as start
+    ct = 0
+    total = 0
+    skip = 0
+    if count > 300:
+        skip = int(count / 300 + .49)
+        print('Since more than 300 records were returned, skip is set to %i' % skip, dt.datetime.now())
+
+    # Insert initial goalpost doc at start time
     newdoc = {'value': 0, 'human_time': '', 'time': 0}
-    # datetimes in DB are utc, convert to local timezone
     newdoc['human_time'] = dt.datetime.fromtimestamp(start).replace(tzinfo=fromZone).astimezone(toZone).strftime(timefmt)
     newdoc['time'] = start
-    newvalue = cleanvalue(resultsarray[skip+1]['value'])
-    newdoc['value'] = newvalue
+    newdoc['value'] = cleanvalue(resultsarray[skip + 1]['value'])
     docs.append(newdoc)
-    
+
+    latestvalue = newdoc['value']
     for doc in resultsarray:
         total += 1
         ct += 1
         newdoc = {'value': 0, 'human_time': '', 'time': 0}
-        # skip if needed
         if ct > skip:
-            #newdoc['value'] = float(doc['value'].replace('b', '').replace('v', '').replace("'", ""))
             newvalue = cleanvalue(doc['value'])
             newdoc['value'] = newvalue
             latestvalue = newvalue
-            # datetimes in DB are utc, convert to local timezone
             newdoc['human_time'] = dt.datetime.fromtimestamp(doc['time']).replace(tzinfo=fromZone).astimezone(toZone).strftime(timefmt)
             newdoc['time'] = doc['time']
             docs.append(newdoc)
             ct = 0
-    if ct !=0:
-        newdoc['value'] = float(doc['value'].replace('b', '').replace('v', '').replace("'", ""))
-        # datetimes in DB are utc, convert to local timezone
+    if ct != 0:
+        newdoc['value'] = cleanvalue(doc['value'])
         newdoc['human_time'] = dt.datetime.fromtimestamp(doc['time']).replace(tzinfo=fromZone).astimezone(toZone).strftime(timefmt)
         newdoc['time'] = doc['time']
         docs.append(newdoc)
 
-    #insert last doc as end 'goalpost' with timestamp of now
-    newdoc = {'value': 0, 'human_time': '', 'time': 0}
-    # datetimes in DB are utc, convert to local timezone
-    newdoc['human_time'] = dt.datetime.timestamp(dt.datetime.now())
-    newdoc['time'] = dt.datetime.timestamp(dt.datetime.now())
-    newdoc['value'] = latestvalue
-    docs.append(newdoc)
-    
+    # Insert final goalpost doc at current time
+    now = dt.datetime.timestamp(dt.datetime.now())
+    docs.append({'value': latestvalue, 'human_time': now, 'time': now})
+
     print('total docs found:', total, ' and returning:', len(docs))
-    print('document returned at ', dt.datetime.now()) #this takes 2.28 sec
     return docs
+
 
 def getdata(node, start, skip, mytype):
     print('getdata starting...')
     docs = []
     qry = {'node_id': node, 'time': {'$gte': start}}
-    #qry = {'node_id': node}
     sortparam = [('time', -1)]
     if mytype:
         qry['type'] = mytype
     print('query is %s and sort is ' % qry, sortparam)
     cursor = sensors.find(qry).sort(sortparam)
-    print('query run.')  
     ct = 0
     total = 0
     for doc in cursor:
         total += 1
         ct += 1
-        # skip if needed
         if ct > skip:
-            doc['_id'] = str(doc['_id'])  # serialization support
-            doc['value'] = float(doc['value'].replace('b', '').replace('v', '').replace("'", ""))
+            doc['_id'] = str(doc['_id'])
+            doc['value'] = cleanvalue(doc['value'])
             doc['human_time'] = dt.datetime.fromtimestamp(doc['time']).strftime(timefmt)
             if 'iso_time' in doc:
                 doc['iso_time'] = str(doc['iso_time'])
             docs.append(doc)
             ct = 0
-
-    # return number of documents and document list.
-    docs.insert(0, docs.__len__())
+    docs.insert(0, len(docs))
     print('total docs found:', total, ' and returning:', len(docs))
     return docs
 
-def testquery():
-    docs = []
-    qry = {'gateway_id': '16E542'}
-    sortparam = [('node_id', -1)]
-    cursor = sensorsLatest.find(qry).sort(sortparam)
-    for doc in cursor:
-        doc['_id'] = str(doc['_id'])  # serialization support
-        doc['value'] = float(doc['value'].replace('b', '').replace('v', '').replace("'", ""))
-        doc['human_time'] = dt.datetime.fromtimestamp(doc['time']).strftime(timefmt)
-        if 'iso_time' in doc:
-            doc['iso_time'] = str(doc['iso_time'])
-        docs.append(doc)
+# ---------------------------------------------------------------------------
+# Nicknames
+# ---------------------------------------------------------------------------
 
-    print(json.dumps(docs))
-    return json.dumps(docs)
+@app.route("/get_nicknames", methods=['GET'])
+def get_nicknames():
+    gateways = request.args.getlist('gw')
+    returndoc = []
+    for gateway in gateways:
+        filt = {'gateway_id': gateway}
+        node_rows = list(db.Nicknames.find(filt, {'_id': 0}).sort([('node_id', 1)]))
+        nicknames_list = [
+            {'node_id': r['node_id'], 'shortname': r['shortname'],
+             'longname': r['longname'], 'seq_no': r['seq_no']}
+            for r in node_rows
+        ]
+        gw_doc = db.GWNicknames.find_one(filt) or {}
+        returndoc.append({
+            'gateway_id': gateway,
+            'longname': gw_doc.get('longname', ''),
+            'seq_no': gw_doc.get('seq_no', 0),
+            'nicknames': nicknames_list,
+        })
+    return json.dumps(returndoc)
 
-def testquery1():
-    returndocs = []
-    nodes = ['42', '50']
-    for node in nodes:
-        record = {'nodeID': 0, 'sensorData': []}
-        record['nodeID'] = node
-        record['sensorData'] = getdatausinggw('16E542', node, 1519344000, 'F', 'EST5EDT') 
-        returndocs.append(record)
-    print(json.dumps(returndocs))
-    return(json.dumps(returndocs))
 
-def testquery2():
-    d = getnodelist('16E542',1519344000)
+@app.route("/save_nicknames", methods=['POST'])
+def save_nicknames():
+    for group in request.get_json():
+        gw = group['gateway_id']
+        gwLongname = group.get('longname', '')
+        db.GWNicknames.update_one(
+            {'gateway_id': gw},
+            {'$set': {'gateway_id': gw, 'longname': gwLongname}, '$inc': {'seq_no': 1}},
+            upsert=True)
+        for item in group.get('nicknames', []):
+            db.Nicknames.update_one(
+                {'gateway_id': gw, 'node_id': item['nodeID']},
+                {'$set': {
+                    'gateway_id': gw, 'node_id': item['nodeID'],
+                    'shortname': item['shortname'], 'longname': item['longname'],
+                }, '$inc': {'seq_no': 1}},
+                upsert=True)
+    return 'OK'
 
-def testquery3():
-    period=1
-    start=getstart(int(period)*24)
-    d = getdatausinggw('16E542','72',start,'F','EST5EDT')
-    print(json.dumps(d))
+# ---------------------------------------------------------------------------
+# Third-Party Services (Sense Energy)
+# ---------------------------------------------------------------------------
 
-def testquery4():
-    start=getstart(1)
-    d = getlatest('16E542',start)
-    print(json.dumps(d))
+def _load_3p_services(logins):
+    results = []
+    for login in logins:
+        for row in db.ThirdPartyServices.find({'login': login}).sort([('service_name', 1)]):
+            results.append({
+                'service_name': row['service_name'],
+                'login': row['login'],
+                'password': row['password'],
+                'type': row['service_type'],
+            })
+    return results
 
-def testquery5():
-    nodes = ['70', '72']
-    returndocs = []
-    starttime = dt.datetime.now(tzutc())
-    returndocs = gwiteratenodes('16E542', nodes, 'F', 24, 'EST5EDT')
-    endtime = dt.datetime.now(tzutc())
-    print('executed in ', endtime - starttime)
 
-if __name__ == "__main__":
-    values = testquery5() 
-    
+@app.route("/add_3p_service", methods=['POST'])
+def add_3p_service():
+    conn_data = request.get_json()
+    db.ThirdPartyServices.update_one(
+        {'service_name': conn_data['service_name'], 'login': conn_data['login']},
+        {'$set': {
+            'service_name': conn_data['service_name'],
+            'login': conn_data['login'],
+            'password': conn_data['password'],
+            'service_type': conn_data['service_type'],
+        }},
+        upsert=True)
+    return 'OK'
+
+
+@app.route("/get_3p_services", methods=['GET'])
+def get_3p_services():
+    logins = request.args.getlist('logins')
+    return json.dumps(_load_3p_services(logins))
+
+
+@app.route("/testsense", methods=['GET'])
+def testsense():
+    from sense_energy import Senseable
+    login = request.args.get('login')
+    key = request.args.get('key')
+    svc = _load_3p_services([login])
+    password = decrypt_password_aes(svc[0]['password'], key)
+    sense = Senseable()
+    sense.authenticate(login, password)
+    sense.update_realtime()
+    pwr = round(sense.active_power, 2)
+    gw_name = '%s@%s' % (login, svc[0]['service_name'])
+    now = dt.datetime.timestamp(dt.datetime.now())
+    db.Sensors.insert_one({
+        'model': svc[0]['type'], 'gateway_id': gw_name,
+        'node_id': '0', 'type': 'PWR', 'value': str(pwr), 'time': now,
+    })
+    db.SensorsLatest.update_one(
+        {'gateway_id': gw_name, 'node_id': '0', 'type': 'PWR'},
+        {'$set': {
+            'model': svc[0]['type'], 'gateway_id': gw_name,
+            'node_id': '0', 'type': 'PWR', 'value': str(pwr), 'time': now,
+        }},
+        upsert=True)
+    return json.dumps(pwr)
+
+# ---------------------------------------------------------------------------
+# User Profiles
+# ---------------------------------------------------------------------------
+
+@app.route("/user_profile", methods=['GET'])
+def get_user_profile():
+    print('DEBUG: get_user_profile called with args:', request.args)
+    email = request.args.get('email', '')
+    if not email:
+        return json.dumps({}), 400
+    doc = db.UserProfiles.find_one({'email': email}, {'_id': 0})
+    if doc is None:
+        return json.dumps({}), 404
+    return json.dumps(doc)
+
+
+@app.route("/user_profile", methods=['POST'])
+def save_user_profile():
+    print('DEBUG: save_user_profile called with JSON:', request.get_json())
+    data = request.get_json()
+    email = data.get('email', '')
+    if not email:
+        return 'missing email', 400
+    db.UserProfiles.update_one(
+        {'email': email},
+        {'$set': {
+            'email': email,
+            'gateway_ids': data.get('gateway_ids', []),
+            'updated_at': dt.datetime.now(dt.timezone.utc).timestamp(),
+        }},
+        upsert=True)
+    return 'OK'
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5050, debug=True)

@@ -1,16 +1,19 @@
 [[source]]
-
 url = "https://pypi.python.org/simple"
 verify_ssl = true
 name = "pypi"
 
-
 [packages]
-
 pymongo = "*"
 flask = "*"
 flask-cors = "*"
 gunicorn = "*"
-
+python-dotenv = "*"
+google-auth = "*"
+requests = "*"
+python-dateutil = "*"
 
 [dev-packages]
+pytest = "*"
+mongomock = "*"
+cryptography = "*"

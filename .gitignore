@@ -111,3 +111,12 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+# Project-specific artifacts
+nohup.out
+*.tar
+*.SAV
+
+# SSL/TLS sensitive material
+ssl-dhparams.pem
+certs/

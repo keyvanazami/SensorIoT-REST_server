@@ -1,0 +1,11 @@
+pipenv
+pymongo
+datetime
+python-dateutil
+flask
+flask-cors
+gunicorn
+certbot
+certbot-nginx
+sense-energy
+dotenv
