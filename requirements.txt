@@ -9,3 +9,4 @@ certbot
 certbot-nginx
 sense-energy
 dotenv
+requests
