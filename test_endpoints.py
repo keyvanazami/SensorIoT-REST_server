@@ -1,5 +1,6 @@
 """Integration tests for REST API endpoints (Flask test client + mongomock)."""
 import json
+from unittest.mock import patch
 
 import pytest
 
@@ -89,49 +90,63 @@ class TestNodelists:
 # ── GET & POST /user_profile ─────────────────────────────────────────────────
 
 class TestUserProfile:
+    TEST_EMAIL = 'test@example.com'
+    AUTH_HEADERS = {'Authorization': 'Bearer fake_token'}
+
+    @pytest.fixture(autouse=True)
+    def mock_token_verification(self):
+        """Patch _verify_google_token so tests don't hit Google's servers."""
+        with patch('server._verify_google_token', return_value=self.TEST_EMAIL):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def clean_profiles(self):
+        import server as _server
+        yield
+        _server.db.UserProfiles.drop()
+
     def test_post_creates_profile(self, client):
         resp = client.post(
             '/user_profile',
-            data=json.dumps({'email': 'test@example.com', 'gateway_ids': ['GW-1']}),
+            data=json.dumps({'gateway_ids': ['GW-1']}),
             content_type='application/json',
+            headers=self.AUTH_HEADERS,
         )
         assert resp.status_code == 200
         assert b'OK' in resp.data
 
     def test_get_returns_created_profile(self, client):
-        email = 'getprofile@example.com'
         client.post(
             '/user_profile',
-            data=json.dumps({'email': email, 'gateway_ids': ['GW-A']}),
+            data=json.dumps({'gateway_ids': ['GW-A']}),
             content_type='application/json',
+            headers=self.AUTH_HEADERS,
         )
-        data = json.loads(client.get(f'/user_profile?email={email}').data)
-        assert data['email'] == email
+        data = json.loads(client.get('/user_profile', headers=self.AUTH_HEADERS).data)
+        assert data['email'] == self.TEST_EMAIL
         assert 'GW-A' in data['gateway_ids']
 
-    def test_get_unknown_email_returns_404(self, client):
-        assert client.get('/user_profile?email=nobody@example.com').status_code == 404
+    def test_get_unknown_returns_404(self, client):
+        # No profile created for this token's email → 404
+        assert client.get('/user_profile', headers=self.AUTH_HEADERS).status_code == 404
 
-    def test_get_missing_email_returns_400(self, client):
-        assert client.get('/user_profile').status_code == 400
+    def test_missing_auth_header_returns_401(self, client):
+        assert client.get('/user_profile').status_code == 401
 
-    def test_post_missing_email_returns_400(self, client):
-        resp = client.post(
-            '/user_profile',
-            data=json.dumps({'gateway_ids': ['GW-1']}),
-            content_type='application/json',
-        )
-        assert resp.status_code == 400
+    def test_invalid_token_returns_401(self, client):
+        with patch('server._verify_google_token', return_value=None):
+            resp = client.get('/user_profile', headers={'Authorization': 'Bearer bad_token'})
+            assert resp.status_code == 401
 
     def test_post_updates_existing_profile(self, client):
-        email = 'update@example.com'
         for gw in (['GW-OLD'], ['GW-NEW']):
             client.post(
                 '/user_profile',
-                data=json.dumps({'email': email, 'gateway_ids': gw}),
+                data=json.dumps({'gateway_ids': gw}),
                 content_type='application/json',
+                headers=self.AUTH_HEADERS,
             )
-        data = json.loads(client.get(f'/user_profile?email={email}').data)
+        data = json.loads(client.get('/user_profile', headers=self.AUTH_HEADERS).data)
         assert data['gateway_ids'] == ['GW-NEW']
 
 

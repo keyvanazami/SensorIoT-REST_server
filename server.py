@@ -1,6 +1,9 @@
-from flask import Flask, request
+from flask import Flask, request, g
 from flask_cors import CORS
 from dotenv import load_dotenv
+from functools import wraps
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 from dateutil.tz import tzutc, gettz
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -8,6 +11,7 @@ from cryptography.hazmat.primitives import padding
 from pymongo import MongoClient
 import pymongo
 import json
+import os
 import datetime as dt
 import base64
 load_dotenv()
@@ -17,12 +21,48 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 print('connecting to mongo...')
-client = MongoClient('localhost', 27017)
+client = MongoClient(os.getenv('MONGODB_HOST', 'localhost'), 27017)
 db = client['gdtechdb_prod']
 sensors = db['Sensors']
 sensorsLatest = db['SensorsLatest']
 nicknames = db['Nicknames']
 userProfiles = db['UserProfiles']
+
+import app_state as _app_state
+_app_state.sensors_latest = sensorsLatest
+_app_state.user_profiles = userProfiles
+_app_state.nicknames_col = nicknames
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
+def _verify_google_token(token):
+    """Verify a Google ID token and return the email, or None if invalid."""
+    try:
+        audience = os.getenv('GOOGLE_WEB_CLIENT_ID')
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), audience)
+        return idinfo.get('email')
+    except Exception as e:
+        print(f'Token verification failed: {e}')
+        return None
+
+
+def require_google_auth(f):
+    """Decorator: verifies Bearer token, sets g.user_email, or returns 401."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return json.dumps({'error': 'missing token'}), 401
+        token = auth_header[len('Bearer '):]
+        email = _verify_google_token(token)
+        if not email:
+            return json.dumps({'error': 'invalid token'}), 401
+        g.user_email = email
+        return f(*args, **kwargs)
+    return decorated
+
 
 # ---------------------------------------------------------------------------
 # App
@@ -412,11 +452,9 @@ def testsense():
 # ---------------------------------------------------------------------------
 
 @app.route("/user_profile", methods=['GET'])
+@require_google_auth
 def get_user_profile():
-    print('DEBUG: get_user_profile called with args:', request.args)
-    email = request.args.get('email', '')
-    if not email:
-        return json.dumps({}), 400
+    email = g.user_email
     doc = db.UserProfiles.find_one({'email': email}, {'_id': 0})
     if doc is None:
         return json.dumps({}), 404
@@ -424,12 +462,10 @@ def get_user_profile():
 
 
 @app.route("/user_profile", methods=['POST'])
+@require_google_auth
 def save_user_profile():
-    print('DEBUG: save_user_profile called with JSON:', request.get_json())
-    data = request.get_json()
-    email = data.get('email', '')
-    if not email:
-        return 'missing email', 400
+    data = request.get_json() or {}
+    email = g.user_email
     db.UserProfiles.update_one(
         {'email': email},
         {'$set': {
@@ -439,6 +475,28 @@ def save_user_profile():
         }},
         upsert=True)
     return 'OK'
+
+# ---------------------------------------------------------------------------
+# Google Home
+# ---------------------------------------------------------------------------
+
+@app.route('/google-home/sync', methods=['POST'])
+def google_home_sync():
+    import requests, os
+    user_id = (request.get_json(silent=True) or {}).get('userId') or request.form.get('userId')
+    if not user_id:
+        return json.dumps({'error': 'userId required'}), 400
+    api_key = os.getenv('GOOGLE_HOMEGRAPH_API_KEY')
+    if not api_key:
+        return json.dumps({'error': 'HomeGraph API key not configured'}), 500
+    resp = requests.post(
+        'https://homegraph.googleapis.com/v1/devices:requestSync',
+        params={'key': api_key},
+        json={'agentUserId': user_id}
+    )
+    if resp.status_code == 200:
+        return json.dumps({'success': True}), 200
+    return json.dumps({'error': 'sync failed', 'details': resp.text}), resp.status_code
 
 # ---------------------------------------------------------------------------
 # Entry Point
