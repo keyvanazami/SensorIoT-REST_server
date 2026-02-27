@@ -51,6 +51,7 @@ SEED_TS = 1_708_643_284.0  # fixed timestamp for deterministic assertions
 @pytest.fixture
 def seed_db():
     """Insert representative documents and clean up afterward."""
+    _server.userProfiles.insert_one({'email': 'test@example.com', 'gateway_ids': ['GW-TEST']})
     _server.sensorsLatest.insert_many([
         {
             'gateway_id': 'GW-TEST',

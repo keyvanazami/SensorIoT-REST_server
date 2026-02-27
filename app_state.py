@@ -24,3 +24,8 @@ MOCK_DEVICES = {
         }
     }
 }
+
+# MongoDB collection references — injected by server.py at startup
+sensors_latest = None
+user_profiles = None
+nicknames_col = None
