@@ -6,6 +6,12 @@ server.py calls MongoClient at module level.  The patcher is started here at
 conftest.py module-load time, which pytest guarantees happens before any test
 file is collected or imported.
 """
+import os
+import sys
+
+# Make server.py and sibling modules importable from the tests/ subdirectory.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import mongomock
 import pytest
 

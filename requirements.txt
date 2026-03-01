@@ -10,3 +10,13 @@ certbot-nginx
 sense-energy
 dotenv
 requests
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+oauthlib
+requests-oauthlib
+numpy
+pandas
+scikit-learn
+joblib

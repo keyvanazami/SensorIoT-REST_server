@@ -10,20 +10,24 @@ RUN apt-get update && apt-get install -y python3 python3-pip python3-venv
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
-COPY requirements.txt / 
-RUN pip install -r requirements.txt
+COPY requirements.txt /requirements.txt
+RUN pip install -r /requirements.txt
 
+# Pre-create models directory (mounted as a volume at runtime for persistence)
+RUN mkdir -p /models
 
-# Add your application code
-COPY ./*.py /
-COPY ./startup.sh /
-COPY ./nginx.conf /etc/nginx/
+# Shared anomaly detection module (madi detectors + utils, no TF needed)
+COPY anomalydetection/ /anomalydetection/
+
+# Add server application code
+COPY *.py /
+COPY nginx.conf /etc/nginx/
 RUN ln -s /app/venv/bin/certbot /usr/bin/certbot
-COPY options-ssl-nginx.conf /etc/letsencrypt/options-ssl-nginx.conf 
+COPY options-ssl-nginx.conf /etc/letsencrypt/options-ssl-nginx.conf
 COPY certs/*.pem /etc/letsencrypt/live/brintontech.com/
-COPY ./ssl-dhparams.pem /etc/letsencrypt/ssl-dhparams.pem
+COPY ssl-dhparams.pem /etc/letsencrypt/ssl-dhparams.pem
 #RUN certbot --nginx
-COPY public /
+#COPY SensorIoT-REST_server/public/ /
 
 # final configuration
 #ENV FLASK_APP=hello

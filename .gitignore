@@ -120,3 +120,11 @@ nohup.out
 # SSL/TLS sensitive material
 ssl-dhparams.pem
 certs/
+
+# Model outputs
+output/
+models/
+*.tar
+*.bak
+*.SAV
+*.log

@@ -12,9 +12,14 @@ from pymongo import MongoClient
 import pymongo
 import json
 import os
+import threading
+import time
+import uuid
 import datetime as dt
 import base64
 load_dotenv()
+
+import anomaly_training as _at
 
 # ---------------------------------------------------------------------------
 # Database
@@ -201,15 +206,12 @@ def gw_data(gw):
         period = int(request.args.get('period')) * 24
     except (ValueError, TypeError):
         period = 24
-    print('calling gwiteratenodes with', gw, nodes, type, period, timezone, 'at', dt.datetime.now())
     return json.dumps(gwiteratenodes(gw, nodes, type, period, timezone))
 
 
 def getnodelist(gw, start):
     qry = {'gateway_id': gw, 'time': {'$gte': start}}
-    print('query is %s' % qry)
     values = sensorsLatest.distinct('node_id', qry)
-    print('query returned at', dt.datetime.now())
     return values
 
 
@@ -245,7 +247,6 @@ def gwiteratenodes(gw, nodes, type, period, timezone):
 
 
 def getdatausinggw(gw, node, start, mytype, timezone):
-    print('getdatausinggw starting. C extensions in use:', pymongo.has_c())
     docs = []
     empty_results = {'results': '0'}
 
@@ -262,12 +263,9 @@ def getdatausinggw(gw, node, start, mytype, timezone):
     if mytype:
         qry['type'] = mytype
 
-    print('query is %s and sort is ' % qry, sortparam)
-    print('starting query at', dt.datetime.now())
     resultsarray = list(sensors.find(qry).sort(sortparam).batch_size(100000))
     count = len(resultsarray)
-    print('%i records returned' % count, dt.datetime.now())
-
+   
     if count == 0:
         return empty_results
 
@@ -308,18 +306,15 @@ def getdatausinggw(gw, node, start, mytype, timezone):
     now = dt.datetime.timestamp(dt.datetime.now())
     docs.append({'value': latestvalue, 'human_time': now, 'time': now})
 
-    print('total docs found:', total, ' and returning:', len(docs))
     return docs
 
 
 def getdata(node, start, skip, mytype):
-    print('getdata starting...')
     docs = []
     qry = {'node_id': node, 'time': {'$gte': start}}
     sortparam = [('time', -1)]
     if mytype:
         qry['type'] = mytype
-    print('query is %s and sort is ' % qry, sortparam)
     cursor = sensors.find(qry).sort(sortparam)
     ct = 0
     total = 0
@@ -335,7 +330,6 @@ def getdata(node, start, skip, mytype):
             docs.append(doc)
             ct = 0
     docs.insert(0, len(docs))
-    print('total docs found:', total, ' and returning:', len(docs))
     return docs
 
 # ---------------------------------------------------------------------------
@@ -475,6 +469,110 @@ def save_user_profile():
         }},
         upsert=True)
     return 'OK'
+
+# ---------------------------------------------------------------------------
+# ML Anomaly Detection
+# ---------------------------------------------------------------------------
+
+# In-memory job registry (lives for the process lifetime).
+_training_jobs: dict = {}
+
+
+def _run_training(job_id: str, gateway_ids: list) -> None:
+    """Background thread: train models for all nodes in all gateways."""
+    all_results = []
+    try:
+        for gw_id in gateway_ids:
+            results = _at.train_for_gateway(gw_id, db)
+            all_results.extend(results)
+        _training_jobs[job_id] = {'status': 'done', 'results': all_results}
+        print(f'[train] Job {job_id} done: {len(all_results)} node(s) processed')
+    except Exception as exc:
+        _training_jobs[job_id] = {'status': 'failed', 'error': str(exc)}
+        print(f'[train] Job {job_id} failed: {exc}')
+
+
+@app.route('/train_anomaly_model', methods=['POST'])
+def train_anomaly_model():
+    data = request.get_json() or {}
+    gateway_ids = data.get('gateway_ids', [])
+    if not gateway_ids:
+        return json.dumps({'error': 'gateway_ids required'}), 400
+
+    job_id = str(uuid.uuid4())
+    _training_jobs[job_id] = {'status': 'running', 'started_at': time.time()}
+
+    t = threading.Thread(target=_run_training, args=(job_id, gateway_ids), daemon=True)
+    t.start()
+
+    return json.dumps({'job_id': job_id, 'status': 'started'})
+
+
+@app.route('/training_status', methods=['GET'])
+def training_status():
+    job_id = request.args.get('job_id', '')
+    job = _training_jobs.get(job_id)
+    if job is None:
+        return json.dumps({'error': 'unknown job_id'}), 404
+    return json.dumps({'job_id': job_id, **job})
+
+
+@app.route('/predict_anomaly', methods=['GET'])
+def predict_anomaly():
+    gateway_id = request.args.get('gateway_id', '')
+    node_id    = request.args.get('node_id', '')
+    try:
+        period_days = int(request.args.get('period', '7'))
+    except (ValueError, TypeError):
+        period_days = 7
+
+    if not gateway_id or not node_id:
+        return json.dumps({'error': 'gateway_id and node_id required'}), 400
+
+    if not _at.model_exists(gateway_id):
+        return json.dumps({'error': 'no model trained yet for this gateway'}), 404
+
+    try:
+        model, metadata = _at.load_model(gateway_id)
+    except FileNotFoundError:
+        return json.dumps({'error': 'model files not found'}), 404
+
+    feature_columns = metadata.get('feature_columns', [])
+
+    # Build the same wide gateway DataFrame used at training time, for the
+    # requested period. get_gateway_dataframe includes the 'time_rounded' column.
+    gw_df = _at.get_gateway_dataframe(db, gateway_id, lookback_days=period_days)
+    if gw_df is None or gw_df.empty:
+        return json.dumps({'anomalous_timestamps': []})
+
+    # Restrict to columns the model was trained on (ignore nodes added post-training)
+    available = [c for c in feature_columns if c in gw_df.columns]
+    pred_df = gw_df[['time_rounded'] + available].dropna(subset=available)
+
+    anomalous_ts = _at.predict_anomalies(model, pred_df, feature_columns=available)
+
+    # Filter to timestamps where the requested node has a temperature reading
+    node_f_col = f'{node_id}_F'
+    if node_f_col in pred_df.columns:
+        node_ts = set(pred_df.loc[pred_df[node_f_col].notna(), 'time_rounded'].tolist())
+        anomalous_ts = [ts for ts in anomalous_ts if ts in node_ts]
+
+    return json.dumps({'anomalous_timestamps': anomalous_ts})
+
+
+@app.route('/anomaly_model_status', methods=['GET'])
+def anomaly_model_status():
+    gateway_id = request.args.get('gateway_id', '')
+    if not gateway_id:
+        return json.dumps({'error': 'gateway_id required'}), 400
+
+    meta_path = os.path.join(_at.MODELS_DIR, str(gateway_id), 'metadata.json')
+    if not os.path.isfile(meta_path):
+        return json.dumps({})
+
+    with open(meta_path) as f:
+        return json.dumps(json.load(f))
+
 
 # ---------------------------------------------------------------------------
 # Google Home

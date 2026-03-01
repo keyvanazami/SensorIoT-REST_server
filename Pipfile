@@ -12,6 +12,10 @@ google-auth = "*"
 requests = "*"
 python-dateutil = "*"
 flask = "*"
+numpy = "*"
+pandas = "*"
+scikit-learn = "*"
+joblib = "*"
 
 [dev-packages]
 pytest = "*"
