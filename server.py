@@ -32,6 +32,7 @@ sensors = db['Sensors']
 sensorsLatest = db['SensorsLatest']
 nicknames = db['Nicknames']
 userProfiles = db['UserProfiles']
+noaaSettings = db['NOAASettings']
 
 import app_state as _app_state
 _app_state.sensors_latest = sensorsLatest
@@ -469,6 +470,69 @@ def save_user_profile():
         }},
         upsert=True)
     return 'OK'
+
+# ---------------------------------------------------------------------------
+# NOAA Weather Forecast
+# ---------------------------------------------------------------------------
+
+@app.route('/forecast/<gw>', methods=['GET'])
+def forecast(gw):
+    """Return future-dated NOAA forecast records for a gateway, sorted by time.
+
+    Query params:
+      node  — node_id to filter on (default: 'noaa_forecast')
+      type  — sensor type to filter on (default: 'F')
+    """
+    node = request.args.get('node', 'noaa_forecast')
+    mytype = request.args.get('type', 'F')
+    now_ts = time.time()
+    cursor = sensors.find(
+        {'gateway_id': gw, 'node_id': node, 'time': {'$gt': now_ts}, 'type': mytype},
+        sort=[('time', 1)],
+    )
+    docs = []
+    for doc in cursor:
+        try:
+            docs.append({
+                'node_id': doc['node_id'],
+                'type': doc['type'],
+                'gateway_id': doc['gateway_id'],
+                'value': cleanvalue(str(doc.get('value', 0))),
+                'time': doc['time'],
+                'human_time': dt.datetime.fromtimestamp(doc['time']).strftime(timefmt),
+            })
+        except Exception:
+            pass
+    return json.dumps(docs)
+
+
+@app.route('/noaa_settings', methods=['GET'])
+@require_google_auth
+def get_noaa_settings():
+    """Return the NOAA settings for the authenticated user."""
+    doc = noaaSettings.find_one({'email': g.user_email}, {'_id': 0})
+    return json.dumps(doc or {})
+
+
+@app.route('/noaa_settings', methods=['POST'])
+@require_google_auth
+def save_noaa_settings():
+    """Create or update NOAA settings for the authenticated user."""
+    data = request.get_json() or {}
+    noaaSettings.update_one(
+        {'email': g.user_email},
+        {'$set': {
+            'email': g.user_email,
+            'lat': data.get('lat'),
+            'lon': data.get('lon'),
+            'gateway_id': data.get('gateway_id'),
+            'outside_sensor_id': data.get('outside_sensor_id'),
+            'enabled': data.get('enabled', True),
+        }},
+        upsert=True,
+    )
+    return 'OK'
+
 
 # ---------------------------------------------------------------------------
 # ML Anomaly Detection
