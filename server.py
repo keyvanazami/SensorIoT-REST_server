@@ -477,17 +477,21 @@ def save_user_profile():
 
 @app.route('/forecast/<gw>', methods=['GET'])
 def forecast(gw):
-    """Return future-dated NOAA forecast records for a gateway, sorted by time.
+    """Return NOAA forecast records for a gateway, sorted by time.
 
     Query params:
-      node  — node_id to filter on (default: 'noaa_forecast')
-      type  — sensor type to filter on (default: 'F')
+      node       — node_id to filter on (default: 'noaa_forecast')
+      type       — sensor type to filter on (default: 'F')
+      hours_back — also include historical records this many hours into the past
+                   (default: 0, i.e. future only)
     """
     node = request.args.get('node', 'noaa_forecast')
     mytype = request.args.get('type', 'F')
+    hours_back = int(request.args.get('hours_back', 0))
     now_ts = time.time()
+    since_ts = now_ts - hours_back * 3600
     cursor = sensors.find(
-        {'gateway_id': gw, 'node_id': node, 'time': {'$gt': now_ts}, 'type': mytype},
+        {'gateway_id': gw, 'node_id': node, 'time': {'$gt': since_ts}, 'type': mytype},
         sort=[('time', 1)],
     )
     docs = []
